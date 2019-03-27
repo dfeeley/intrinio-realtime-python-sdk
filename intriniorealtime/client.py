@@ -20,18 +20,18 @@ class IntrinioRealtimeClient:
     def __init__(self, options):
         if options is None:
             raise ValueError("Options parameter is required")
-            
+
         self.options = options
         self.api_key = options.get('api_key')
         self.username = options.get('username')
         self.password = options.get('password')
         self.provider = options.get('provider')
-        
+
         if 'channels' in options:
             self.channels = set(options['channels'])
         else:
             self.channels = set()
-            
+
         if 'logger' in options:
             self.logger = options['logger']
         else:
@@ -44,12 +44,12 @@ class IntrinioRealtimeClient:
             else:
                 self.logger.setLevel(logging.INFO)
             self.logger.addHandler(log_handler)
-            
+
         if 'max_queue_size' in options:
             self.quotes = queue.Queue(maxsize=options['max_queue_size'])
         else:
             self.quotes = queue.Queue(maxsize=MAX_QUEUE_SIZE)
-        
+
 
         if self.api_key:
             if not self.valid_api_key(self.api_key):
@@ -60,10 +60,10 @@ class IntrinioRealtimeClient:
 
             if not self.username:
                 raise ValueError("Parameter 'username' must be specified")
-            
+
             if not self.password:
                 raise ValueError("Parameter 'password' must be specified")
-        
+
         if 'on_quote' in options:
             if not callable(options['on_quote']):
                 raise ValueError("Parameter 'on_quote' must be a function")
@@ -71,20 +71,19 @@ class IntrinioRealtimeClient:
                 self.on_quote = options['on_quote']
         else:
             self.on_quote = None
-        
+
         if self.provider not in PROVIDERS:
             raise ValueError(f"Parameter 'provider' is invalid, use one of {PROVIDERS}")
-        
+
         self.ready = False
         self.token = None
         self.ws = None
         self.quote_receiver = None
         self.quote_handler = None
+        self.heartbeat = None
         self.joined_channels = set()
         self.last_queue_warning_time = 0
-        
-        QuoteHandler(self).start()
-        Heartbeat(self).start()
+        self.closing_gracefully = False
 
     def auth_url(self):
         auth_url = ""
@@ -120,32 +119,38 @@ class IntrinioRealtimeClient:
             return "wss://crypto.intrinio.com/socket/websocket?vsn=1.0.0&token=" + self.token
         elif self.provider == FXCM:
             return "wss://fxcm.intrinio.com/socket/websocket?vsn=1.0.0&token=" + self.token
-        
+
     def connect(self):
         self.logger.info("Connecting...")
-        
+
         self.ready = False
         self.joined_channels = set()
-        
+
         if self.ws:
+            self.closing_gracefully = True
             self.ws.close()
             time.sleep(1)
-            
+            self.closing_gracefully = False
+
         try:
             self.refresh_token()
             self.refresh_websocket()
+            self.refresh_heartbeat()
+            self.refresh_quote_handler()
         except Exception as e:
             self.logger.error(f"Cannot connect: {e}")
             return self.self_heal()
-            
+
     def disconnect(self):
         self.ready = False
         self.joined_channels = set()
-        
+
         if self.ws:
+            self.closing_gracefully = True
             self.ws.close()
             time.sleep(1)
-            
+            self.closing_gracefully = False
+
     def keep_alive(self):
         while True:
             pass
@@ -155,10 +160,10 @@ class IntrinioRealtimeClient:
             response = requests.get(self.auth_url())
         else:
             response = requests.get(self.auth_url(), auth=(self.username, self.password))
-        
+
         if response.status_code != 200:
             raise RuntimeError("Auth failed")
-            
+
         self.token = response.text
         self.logger.info("Authentication successful!")
 
@@ -166,14 +171,26 @@ class IntrinioRealtimeClient:
         self.quote_receiver = QuoteReceiver(self)
         self.quote_receiver.start()
 
+    def refresh_heartbeat(self):
+        if self.heartbeat is None or not self.heartbeat.is_alive():
+            self.logger.warn('Starting heartbeat')
+            self.heartbeat = Heartbeat(self)
+            self.heartbeat.start()
+
+    def refresh_quote_handler(self):
+        if self.quote_handler is None or not self.quote_handler.is_alive():
+            self.logger.warn('Starting quote_handler')
+            self.quote_handler = QuoteHandler(self)
+            self.quote_handler.start()
+
     def self_heal(self):
         time.sleep(SELF_HEAL_TIME)
         self.connect()
-            
+
     def on_connect(self):
         self.ready = True
         self.refresh_channels()
-        
+
     def on_queue_full(self):
         if time.time() - self.last_queue_warning_time > 1:
             self.logger.error("Quote queue is full! Dropped some new quotes")
@@ -182,14 +199,14 @@ class IntrinioRealtimeClient:
     def join(self, channels):
         if isinstance(channels, str):
             channels = [channels]
-            
+
         self.channels = self.channels | set(channels)
         self.refresh_channels()
 
     def leave(self, channels):
         if isinstance(channels, str):
             channels = [channels]
-            
+
         self.channels = self.channels - set(channels)
         self.refresh_channels()
 
@@ -208,7 +225,7 @@ class IntrinioRealtimeClient:
             msg = self.join_message(channel)
             self.ws.send(json.dumps(msg))
             self.logger.info(f"Joined channel {channel}")
-        
+
         # Leave old channels
         old_channels = self.joined_channels - self.channels
         self.logger.debug(f"Old channels: {old_channels}")
@@ -216,10 +233,10 @@ class IntrinioRealtimeClient:
             msg = self.leave_message(channel)
             self.ws.send(json.dumps(msg))
             self.logger.info(f"Left channel {channel}")
-        
+
         self.joined_channels = self.channels.copy()
         self.logger.debug(f"Current channels: {self.joined_channels}")
-        
+
     def join_message(self, channel):
         if self.provider == IEX:
             return {
@@ -243,7 +260,7 @@ class IntrinioRealtimeClient:
                 'payload': {},
                 'ref': None
             }
-            
+
     def leave_message(self, channel):
         if self.provider == IEX:
             return {
@@ -267,7 +284,7 @@ class IntrinioRealtimeClient:
                 'payload': {},
                 'ref': None
             }
-            
+
     def parse_iex_topic(self, channel):
         if channel == "$lobby":
             return "iex:lobby"
@@ -275,7 +292,7 @@ class IntrinioRealtimeClient:
             return "iex:lobby:last_price"
         else:
             return f"iex:securities:{channel}"
-        
+
     def valid_api_key(self, api_key):
         if not isinstance(api_key, str):
             return False
@@ -294,17 +311,17 @@ class QuoteReceiver(threading.Thread):
 
     def run(self):
         self.client.ws = websocket.WebSocketApp(
-            self.client.websocket_url(), 
-            on_open = self.on_open, 
+            self.client.websocket_url(),
+            on_open = self.on_open,
             on_close = self.on_close,
-            on_message = self.on_message, 
+            on_message = self.on_message,
             on_error = self.on_error
         )
-            
+
         self.client.logger.debug("QuoteReceiver ready")
         self.client.ws.run_forever()
         self.client.logger.debug("QuoteReceiver exiting")
-        
+
     def on_open(self, ws):
         self.client.logger.info("Websocket opened!")
         if self.client.provider in [IEX, CRYPTOQUOTE, FXCM]:
@@ -312,16 +329,19 @@ class QuoteReceiver(threading.Thread):
 
     def on_close(self, ws):
         self.client.logger.info("Websocket closed!")
+        if not self.client.closing_gracefully:
+            self.client.logger.info("Attempting self-heal")
+            self.client.self_heal()
 
     def on_error(self, ws, error):
         self.client.logger.error(f"Websocket ERROR: {error}")
         self.client.self_heal()
-        
+
     def on_message(self, ws, message):
         message = json.loads(message)
         self.client.logger.debug(f"Received message: {message}")
         quote = None
-        
+
         if message['event'] == 'phx_reply' and message['payload']['status'] == 'error':
             error = message['payload']['response']
             self.client.logger.error(f"Websocket ERROR: {error}")
@@ -370,7 +390,7 @@ class Heartbeat(threading.Thread):
         self.client = client
 
     def run(self):
-        self.client.logger.debug("Heartbeat ready")
+        self.client.logger.info("Heartbeat ready")
         while True:
             time.sleep(HEARTBEAT_TIME)
             if self.client.ready and self.client.ws:
@@ -384,4 +404,4 @@ class Heartbeat(threading.Thread):
                 if msg:
                     self.client.logger.debug(msg)
                     self.client.ws.send(json.dumps(msg))
-                    self.client.logger.debug("Heartbeat!")
+                    self.client.logger.warn("H\r")
